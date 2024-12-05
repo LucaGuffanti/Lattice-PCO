@@ -165,7 +165,7 @@ void copy_data_from_parent_to_child(GPUNode* parent, GPUNode* child)
     err = cudaMemcpy(child->remaining_value, parent->remaining_value, parent->N * sizeof(size_t), cudaMemcpyDeviceToDevice); check_error(err, "cudaMemcpy-DeviceToDevice-RemainingValue");
 }
 
-__global__ void fixpoint_kernel(GPUNode* current, size_t* d_offsets, int* d_constraints, int* d_u)
+__global__ void fixpoint_kernel(GPUNode* current, size_t* d_offsets, int* d_constraints, int* d_u, bool* changed)
 {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= current->N) return;
@@ -182,7 +182,7 @@ __global__ void fixpoint_kernel(GPUNode* current, size_t* d_offsets, int* d_cons
             if (d_constraints[idx * current->N + i] == 1)
             {
                 // If the value is inside the domain of the other variable
-                if (value <= d_u[i])
+                if (value <= d_u[i] && !((current->domains[d_offsets[i] + value / 8] & (1 << (value % 8)))))
                 {
                     const size_t byte_idx = (d_offsets[i] + value) / 8;
                     const size_t bit_idx = (d_offsets[i] + value) % 8;
@@ -241,21 +241,27 @@ void fixpoint(GPUNode* current, std::stack<GPUNode*>& stack, size_t& exploredTre
     cudaError_t err;
     bool changed = true;
     bool no_solution = false;
+    size_t prev_num_of_0s = 0;
 
 
     while (changed)
     {
         changed = false;
         err = cudaMemcpy(d_changed, &changed, sizeof(bool), cudaMemcpyHostToDevice); check_error(err, "cudaMemcpy-HostToDevice-Changed");
-        fixpoint_kernel<<<(current->N + 31) / 32, 32>>>(current, d_offsets, d_constraints, d_u);
+        fixpoint_kernel<<<(current->N + 31) / 32, 32>>>(current, d_offsets, d_constraints, d_u, d_changed);
         err = cudaDeviceSynchronize(); check_error(err, "cudaDeviceSynchronize");
         err = cudaGetLastError(); check_error(err, "fixpoint_kernel");
+
+        cudaMemcpy(&changed, d_changed, sizeof(bool), cudaMemcpyDeviceToHost); check_error(err, "cudaMemcpy-DeviceToHost-Changed");
 
         count_num_of_0s<<<(current->total_bytes + 31) / 32, 32>>>(current->domains, current->total_bytes, d_num_of_0s);
         err = cudaDeviceSynchronize(); check_error(err, "cudaDeviceSynchronize");
         err = cudaGetLastError(); check_error(err, "count_num_of_0s");
         
         const size_t num_of_0s = std::accumulate(d_num_of_0s, d_num_of_0s + current->total_bytes, 0);
+        changed = prev_num_of_0s != num_of_0s;
+        prev_num_of_0s = num_of_0s;
+
         if (num_of_0s == current->N + unused_bits)
         {
             exploredSol++;
@@ -265,6 +271,7 @@ void fixpoint(GPUNode* current, std::stack<GPUNode*>& stack, size_t& exploredTre
         {
             return;
         }
+
 
         // Now iterate over the domains that are not singletons
         for (size_t domain = 0; domain < current->N; ++domain)
@@ -300,7 +307,7 @@ void fixpoint(GPUNode* current, std::stack<GPUNode*>& stack, size_t& exploredTre
                     }
                     current->remaining_value[domain] = value;
                     current->cancelled_values[domain] = u[domain];
-                    changed = true;
+                    //changed = true;
                 }   
             }
         }
